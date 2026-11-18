@@ -16,6 +16,10 @@ Model
   stops a slow recompute from publishing over newer data.
 * ``recompute_jobs`` – durable outbox.  Uploads only enqueue; only a
   successfully committed computation flips day states to ``current``.
+* ``quarantined_cards`` / ``quarantined_events`` – permanent blacklist of
+  anonymous cards and every event number they ever used.  Quarantined rows
+  are excluded from every derivation (old revisions included) and any upload
+  containing such a card or event number is rejected as a whole.
 """
 
 from __future__ import annotations
@@ -112,6 +116,19 @@ CREATE TABLE IF NOT EXISTS app_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS quarantined_cards (
+    card_id      TEXT PRIMARY KEY,
+    reason       TEXT,
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quarantined_events (
+    event_no     TEXT PRIMARY KEY,
+    card_id      TEXT,
+    quarantined_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quarantined_events_card ON quarantined_events (card_id);
 """
 
 

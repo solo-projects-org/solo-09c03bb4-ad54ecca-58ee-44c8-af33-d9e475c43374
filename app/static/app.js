@@ -123,6 +123,49 @@ async function refreshTabs() {
   });
 }
 
+$("#quarantine-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const cardId = $("#quarantine-card").value.trim();
+  const reason = $("#quarantine-reason").value.trim();
+  const result = $("#quarantine-result");
+  const btn = $("#quarantine-btn");
+  if (!cardId) return;
+  if (!confirm(`永久隔离卡号 ${cardId}？该卡及全部事件号将不再进入客流统计，且不可撤销。`)) return;
+  btn.disabled = true;
+  result.hidden = false;
+  result.className = "result";
+  result.textContent = "隔离并重算中…";
+  try {
+    const res = await fetch("/api/quarantine", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ card_id: cardId, reason }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      result.className = "result error";
+      result.textContent = body.detail || `隔离失败（HTTP ${res.status}）`;
+      return;
+    }
+    const states = Object.entries(body.day_states || {})
+      .map(([day, status]) => `${day}: ${status === "current" ? "已重算并现行" : "待重算（稍后重试）"}`)
+      .join("\n");
+    result.textContent =
+      `卡号 ${body.card_id} ${body.already_quarantined ? "此前已隔离（已刷新事件号）" : "已隔离"}。\n` +
+      `隔离事件号：${body.quarantined_events.join(", ") || "无"}\n` +
+      `受影响日期：${body.affected_days.join(", ") || "无"}\n${states}`;
+    $("#quarantine-card").value = "";
+    $("#quarantine-reason").value = "";
+    await refreshTabs();
+    if (body.affected_days?.length) await loadDay(body.affected_days[0]);
+  } catch (err) {
+    result.className = "result error";
+    result.textContent = `网络错误：${err}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 $("#upload-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const fileInput = $("#csv");

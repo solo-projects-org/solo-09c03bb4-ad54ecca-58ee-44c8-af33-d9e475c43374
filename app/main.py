@@ -7,6 +7,10 @@ GET  /api/days             list of known service dates with publication state
 GET  /api/days/{date}      station-pair counts + pending taps for one date
 POST /api/uploads          multipart CSV upload; accepted, dates invalidated,
                            then recompute is attempted inline
+POST /api/quarantine       isolate an anonymous card permanently (all its
+                           event numbers, all revisions; whole-batch rejection
+                           of later uploads naming them)
+GET  /api/quarantine       list isolated cards and event numbers
 POST /api/recompute        re-queue dates (repair after a failed recompute)
 GET  /api/overview         batches, jobs and day states
 GET  /healthz              liveness
@@ -22,6 +26,7 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 
 from . import db, service
 from .ingest import UploadError
@@ -69,6 +74,7 @@ def index(request: Request):
     with _conn() as conn:
         days = service.known_days(conn)
         data = service.overview(conn)
+        quarantine = service.list_quarantine(conn)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -77,6 +83,7 @@ def index(request: Request):
             "jobs": data["jobs"],
             "job_counts": data["job_counts"],
             "batches": data["batches"],
+            "quarantine": quarantine,
             "tz": str(_local_tz()),
         },
     )
@@ -109,6 +116,51 @@ def api_day(day: str):
 def api_overview():
     with _conn() as conn:
         return service.overview(conn)
+
+
+class QuarantineRequest(BaseModel):
+    card_id: str = Field(min_length=1, max_length=200)
+    reason: str = Field(default="", max_length=500)
+
+
+@app.get("/api/quarantine")
+def api_quarantine():
+    with _conn() as conn:
+        return service.list_quarantine(conn)
+
+
+@app.post("/api/quarantine")
+def api_quarantine_card(body: QuarantineRequest):
+    card_id = body.card_id.strip()
+    if not card_id:
+        raise HTTPException(status_code=400, detail="请填写要隔离的匿名卡号")
+    try:
+        result = service.quarantine_card(_db_path(), card_id, body.reason.strip())
+    except UploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Acceptance is durable: affected dates already have no results.  Try to
+    # publish the recomputation inline; a failure leaves them stale.
+    service.run_pending_jobs(_db_path())
+
+    with _conn() as conn:
+        states = {}
+        if result.affected_days:
+            states = {
+                row["service_date"]: row["status"]
+                for row in conn.execute(
+                    "SELECT service_date, status FROM day_state WHERE service_date IN (%s)"
+                    % ",".join("?" for _ in result.affected_days),
+                    result.affected_days,
+                )
+            }
+    return {
+        "card_id": result.card_id,
+        "already_quarantined": result.already_quarantined,
+        "quarantined_events": result.quarantined_events,
+        "affected_days": result.affected_days,
+        "day_states": states,
+    }
 
 
 @app.post("/api/uploads")

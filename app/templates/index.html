@@ -31,6 +31,53 @@
   </section>
 
   <section class="card">
+    <h2>隔离测试卡</h2>
+    <p class="hint">
+      输入匿名卡号后永久隔离：该卡曾使用的<b>全部事件号及其所有修订</b>不再参与配对，
+      即使事件后来改挂别的卡号也不会回流。受理后受影响日期的站间人数与待核记录立即失效并重算；
+      之后上传只要包含隔离卡号或任一隔离事件号，<b>整批拒绝</b>。此操作不可撤销。
+    </p>
+    <form id="quarantine-form">
+      <input type="text" id="quarantine-card" name="card_id" placeholder="匿名卡号，如 CARD-3" required>
+      <input type="text" id="quarantine-reason" name="reason" placeholder="原因（可选）">
+      <button type="submit" id="quarantine-btn" class="danger">永久隔离</button>
+    </form>
+    <div id="quarantine-result" class="result" hidden></div>
+
+    <h3>已隔离卡号（{{ quarantine.cards | length }}）</h3>
+    <table class="grid">
+      <thead><tr><th>卡号</th><th>原因</th><th>隔离时间 (UTC)</th></tr></thead>
+      <tbody>
+      {% for q in quarantine.cards %}
+        <tr>
+          <td class="mono">{{ q.card_id }}</td>
+          <td class="small">{{ q.reason or '' }}</td>
+          <td class="mono small">{{ q.created_at }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">暂无隔离卡号</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>隔离事件号（{{ quarantine.events | length }}）</h3>
+    <table class="grid">
+      <thead><tr><th>事件号</th><th>来源卡号</th><th>隔离时间 (UTC)</th></tr></thead>
+      <tbody>
+      {% for q in quarantine.events %}
+        <tr>
+          <td class="mono">{{ q.event_no }}</td>
+          <td class="mono">{{ q.card_id or '' }}</td>
+          <td class="mono small">{{ q.quarantined_at }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="3" class="empty">暂无隔离事件号</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card">
     <h2>按日查看</h2>
     <div class="day-tabs" id="day-tabs">
       {% for d in days %}

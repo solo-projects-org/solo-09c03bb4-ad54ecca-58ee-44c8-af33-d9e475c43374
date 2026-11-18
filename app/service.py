@@ -21,6 +21,14 @@ Publication protocol
 4. Any failure leaves the dates ``stale`` with the error recorded.  On
    startup ``recover`` re-queues interrupted jobs, re-queues stale dates that
    lost their job, and demotes any ``current`` date whose epoch is behind.
+5. Quarantine is an accepted data change: one IMMEDIATE transaction records
+   the card and every event number it ever used (all revisions), deletes the
+   affected dates' published rows and marks them stale under the same epoch
+   fence as an upload.  Quarantine and upload serialise on the same SQLite
+   write lock, so whichever commits second sees the other's rows; any upload
+   naming a quarantined card or event number is rejected before a batch is
+   written.  Derivations filter quarantine at read time, so a failed or
+   restarted recompute cannot resurrect an old revision of an isolated card.
 """
 
 from __future__ import annotations
@@ -38,6 +46,10 @@ from .ingest import Tap, UploadError, parse_csv
 from .journeys import Event, Journey, PendingTap, derive
 
 MAX_JOB_ATTEMPTS = 5
+
+
+class QuarantinedUploadError(UploadError):
+    """An upload named a quarantined card or event number (whole batch rejected)."""
 
 
 def utcnow() -> str:
@@ -62,16 +74,24 @@ def _row_to_event(row: sqlite3.Row) -> Event:
 _LATEST_EVENTS = (
     "SELECT e.event_no, e.card_id, e.tap_time, e.station, e.direction, e.revision "
     "FROM events e JOIN (SELECT event_no, MAX(revision) AS rev FROM events GROUP BY event_no) m "
-    "ON m.event_no = e.event_no AND m.rev = e.revision"
+    "ON m.event_no = e.event_no AND m.rev = e.revision "
+    "WHERE e.card_id NOT IN (SELECT card_id FROM quarantined_cards) "
+    "AND e.event_no NOT IN (SELECT event_no FROM quarantined_events)"
 )
 
 
 def load_latest_events(conn: sqlite3.Connection, card_ids: Iterable[str] | None = None) -> list[Event]:
+    """Latest revision per event, with every quarantined card/event number excluded.
+
+    Filtering here (not only when ingesting) is what makes quarantine
+    irrevocable: no recompute, retry or restart can re-derive an isolated
+    card from rows that are still physically in ``events``.
+    """
     if card_ids is not None:
         ids = sorted(set(card_ids))
         if not ids:
             return []
-        sql = _LATEST_EVENTS + " WHERE e.card_id IN (%s)" % ",".join("?" for _ in ids)
+        sql = _LATEST_EVENTS + " AND e.card_id IN (%s)" % ",".join("?" for _ in ids)
         rows = conn.execute(sql, ids).fetchall()
     else:
         rows = conn.execute(_LATEST_EVENTS).fetchall()
@@ -136,6 +156,183 @@ def _stale_days(
 
 
 # ---------------------------------------------------------------------------
+# quarantine (permanent removal of test cards)
+# ---------------------------------------------------------------------------
+
+def _event_owner_cards(conn: sqlite3.Connection, event_nos: Iterable[str]) -> dict[str, set[str]]:
+    """Every card that ever appeared on each event number, all revisions."""
+    ids = sorted(set(event_nos))
+    owners: dict[str, set[str]] = {}
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        rows = conn.execute(
+            "SELECT event_no, card_id FROM events WHERE event_no IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        for row in rows:
+            owners.setdefault(row["event_no"], set()).add(row["card_id"])
+    return owners
+
+
+def _quarantine_events_for_cards(conn: sqlite3.Connection, card_ids: Iterable[str]) -> set[str]:
+    """All event numbers ever used by these cards (any revision)."""
+    ids = sorted(set(card_ids))
+    events: set[str] = set()
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        rows = conn.execute(
+            "SELECT DISTINCT event_no FROM events WHERE card_id IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        events |= {row["event_no"] for row in rows}
+        rows = conn.execute(
+            "SELECT DISTINCT event_no FROM quarantined_events WHERE card_id IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        events |= {row["event_no"] for row in rows}
+    return events
+
+
+def _days_for_cards(conn: sqlite3.Connection, card_ids: Iterable[str]) -> set[str]:
+    ids = sorted(set(card_ids))
+    days: set[str] = set()
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        rows = conn.execute(
+            "SELECT DISTINCT substr(tap_time, 1, 10) AS day FROM events WHERE card_id IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        days |= {row["day"] for row in rows}
+        rows = conn.execute(
+            "SELECT DISTINCT service_date AS day FROM pending_taps WHERE card_id IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        days |= {row["day"] for row in rows}
+    return {d for d in days if d}
+
+
+def _days_of_days_for_events(conn: sqlite3.Connection, event_nos: Iterable[str]) -> set[str]:
+    ids = sorted(set(event_nos))
+    days: set[str] = set()
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        rows = conn.execute(
+            "SELECT DISTINCT substr(tap_time, 1, 10) AS day FROM events WHERE event_no IN (%s)"
+            % ",".join("?" for _ in part),
+            part,
+        ).fetchall()
+        days |= {row["day"] for row in rows}
+    return {d for d in days if d}
+
+
+@dataclass
+class QuarantineResult:
+    card_id: str
+    already_quarantined: bool
+    quarantined_events: list[str]
+    affected_days: list[str]
+    job_id: int | None
+
+
+def quarantine_card(db_path: str | Path, card_id: str, reason: str = "") -> QuarantineResult:
+    """Permanently isolate one anonymous card from all ridership output.
+
+    Everything happens in one IMMEDIATE transaction, serialised with uploads:
+    the card is blacklisted, every event number it ever used (at any
+    revision, including revisions that later moved to another card) is
+    recorded, affected dates are invalidated with a fresh epoch, and a
+    recompute job covering them is queued.  Existing result rows for those
+    dates are deleted in the same transaction, so old numbers cannot be
+    shown while the recompute is pending or after a failure/restart.
+    """
+    card_id = card_id.strip()
+    if not card_id:
+        raise UploadError("请填写要隔离的匿名卡号")
+    conn = db.connect(db_path)
+    try:
+        with db.transaction(conn):
+            return _quarantine(conn, card_id, reason)
+    finally:
+        conn.close()
+
+
+def _quarantine(conn: sqlite3.Connection, card_id: str, reason: str) -> QuarantineResult:
+    now = utcnow()
+    already = conn.execute(
+        "SELECT 1 FROM quarantined_cards WHERE card_id = ?", (card_id,)
+    ).fetchone() is not None
+
+    # Every event number ever used by this card, at any revision.
+    event_nos = _quarantine_events_for_cards(conn, {card_id})
+
+    # Removing those events can change the pairing of any card that owns one
+    # of them (a later revision may have moved an event to another card).
+    # Those cards are not quarantined themselves, but their dates are affected
+    # because their tap sequence changes.
+    owner_cards: set[str] = {card_id}
+    for owners in _event_owner_cards(conn, event_nos).values():
+        owner_cards |= owners
+    if event_nos:
+        owner_cards |= {
+            row["card_id"]
+            for row in conn.execute(
+                "SELECT DISTINCT card_id FROM quarantined_events WHERE event_no IN (%s)"
+                % ",".join("?" for _ in event_nos),
+                sorted(event_nos),
+            ).fetchall()
+        }
+
+    affected = _days_for_cards(conn, owner_cards)
+    affected |= _days_of_days_for_events(conn, event_nos)
+    for day in affected:
+        # Delete first: even if the recompute never runs, the old numbers are
+        # gone rather than merely masked.
+        conn.execute("DELETE FROM results WHERE service_date = ?", (day,))
+        conn.execute("DELETE FROM pending_taps WHERE service_date = ?", (day,))
+
+    conn.execute(
+        "INSERT INTO quarantined_cards (card_id, reason, created_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(card_id) DO UPDATE SET reason = excluded.reason",
+        (card_id, reason or None, now),
+    )
+    for event_no in sorted(event_nos):
+        conn.execute(
+            "INSERT INTO quarantined_events (event_no, card_id, quarantined_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(event_no) DO UPDATE SET quarantined_at = excluded.quarantined_at",
+            (event_no, card_id, now),
+        )
+
+    job_id: int | None = None
+    if affected:
+        _stale_days(conn, sorted(affected), f"卡号 {card_id} 已隔离，结果待重算")
+        job_id = _enqueue_job(conn, sorted(affected), None)
+
+    return QuarantineResult(
+        card_id=card_id,
+        already_quarantined=already,
+        quarantined_events=sorted(event_nos),
+        affected_days=sorted(affected),
+        job_id=job_id,
+    )
+
+
+def list_quarantine(conn: sqlite3.Connection) -> dict:
+    cards = [dict(row) for row in conn.execute(
+        "SELECT card_id, reason, created_at FROM quarantined_cards ORDER BY created_at DESC, card_id"
+    ).fetchall()]
+    events = [dict(row) for row in conn.execute(
+        "SELECT event_no, card_id, quarantined_at FROM quarantined_events "
+        "ORDER BY quarantined_at DESC, event_no"
+    ).fetchall()]
+    return {"cards": cards, "events": events}
+
+
+# ---------------------------------------------------------------------------
 # accepting uploads
 # ---------------------------------------------------------------------------
 
@@ -159,10 +356,58 @@ def accept_upload(db_path: str | Path, filename: str, payload: bytes) -> AcceptR
         conn.close()
 
 
+def _reject_quarantined(
+    conn: sqlite3.Connection, card_ids: Iterable[str], event_nos: Iterable[str]
+) -> None:
+    """Reject the whole upload if it names an isolated card or event number.
+
+    Runs inside the same IMMEDIATE transaction that will write the batch, so
+    it serialises against ``quarantine_card``: an upload that started before
+    a quarantine either commits first (and its dates are then invalidated by
+    the quarantine) or sees the quarantine rows and is refused.  Checked
+    before the ``batches`` row exists, so a refused upload leaves no trace.
+    """
+    cards = sorted(set(card_ids))
+    events = sorted(set(event_nos))
+    hit_cards: set[str] = set()
+    hit_events: set[str] = set()
+    for i in range(0, len(cards), 500):
+        part = cards[i:i + 500]
+        hit_cards |= {
+            row["card_id"]
+            for row in conn.execute(
+                "SELECT card_id FROM quarantined_cards WHERE card_id IN (%s)"
+                % ",".join("?" for _ in part),
+                part,
+            )
+        }
+    for i in range(0, len(events), 500):
+        part = events[i:i + 500]
+        hit_events |= {
+            row["event_no"]
+            for row in conn.execute(
+                "SELECT event_no FROM quarantined_events WHERE event_no IN (%s)"
+                % ",".join("?" for _ in part),
+                part,
+            )
+        }
+    if hit_cards or hit_events:
+        parts = []
+        if hit_cards:
+            parts.append("隔离卡号 " + ", ".join(sorted(hit_cards)))
+        if hit_events:
+            parts.append("隔离事件号 " + ", ".join(sorted(hit_events)))
+        raise QuarantinedUploadError(
+            "上传包含" + "；".join(parts) + "，整批拒绝。隔离卡不得重新进入客流统计。"
+        )
+
+
 def _accept(conn: sqlite3.Connection, filename: str, taps: list[Tap]) -> AcceptResult:
     file_days = sorted({t.day for t in taps})
     card_ids = {t.card_id for t in taps}
     event_nos = sorted({t.event_no for t in taps})
+
+    _reject_quarantined(conn, card_ids, event_nos)
 
     # A correction may reassign an event to another card; the *previous* card's
     # pairing must be re-derived too, even though it is absent from the file.

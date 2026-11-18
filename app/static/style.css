@@ -38,6 +38,8 @@ main { max-width: 1080px; margin: 22px auto 60px; padding: 0 20px; display: grid
 code { background: #eef2f7; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
 form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 input[type=file] { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; background: #fafbfd; }
+input[type=text] { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; background: #fafbfd; min-width: 200px; }
+button.danger { background: var(--bad); }
 button {
   border: 0; border-radius: 8px; padding: 9px 16px; background: var(--accent);
   color: #fff; font-weight: 600; cursor: pointer;

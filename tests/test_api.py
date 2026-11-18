@@ -93,3 +93,54 @@ def test_cross_midnight_correction_via_api(client):
     assert day1["status"] == day2["status"] == "current"
     assert [(p["from_station"], p["to_station"]) for p in day1["station_pairs"]] == [("A", "D")]
     assert day2["trip_total"] == 0
+
+
+def test_quarantine_via_api_and_reject_later_upload(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "A", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "B", "out"),
+        tap("e3", "c2", "2024-05-01T09:00:00Z", "A", "in"),
+        tap("e4", "c2", "2024-05-01T09:30:00Z", "C", "out"),
+    ])
+    res = client.post("/api/quarantine", json={"card_id": "c1", "reason": "测试卡"})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["quarantined_events"] == ["e1", "e2"]
+    assert body["day_states"] == {"2024-05-01": "current"}
+
+    day = client.get("/api/days/2024-05-01").json()
+    assert [(p["from_station"], p["to_station"]) for p in day["station_pairs"]] == [("A", "C")]
+    assert day["pending_total"] == 0
+
+    listing = client.get("/api/quarantine").json()
+    assert [c["card_id"] for c in listing["cards"]] == ["c1"]
+    assert {e["event_no"] for e in listing["events"]} == {"e1", "e2"}
+
+    # Any upload that names the isolated card is rejected in full.
+    mixed = upload(client, [
+        tap("n1", "c9", "2024-05-02T08:00:00Z", "X", "in"),
+        tap("n2", "c1", "2024-05-02T08:20:00Z", "Y", "out"),
+    ])
+    assert mixed.status_code == 400
+    assert "隔离" in mixed.json()["detail"]
+    assert client.get("/api/days/2024-05-02").status_code == 404
+
+    # Any upload that names an isolated event number is rejected too.
+    revive = upload(client, [tap("e2", "c2", "2024-05-01T08:20:00Z", "B", "out", revision=1)])
+    assert revive.status_code == 400
+    assert "e2" in revive.json()["detail"]
+
+    assert client.post("/api/quarantine", json={"card_id": "   "}).status_code == 400
+
+
+def test_index_shows_quarantine_section(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "A", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "B", "out"),
+    ])
+    client.post("/api/quarantine", json={"card_id": "c1"})
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "隔离测试卡" in page.text
+    assert "c1" in page.text
+
